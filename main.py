@@ -7,7 +7,7 @@ import os
 
 app = FastAPI()
 
-# Optional CORS setup for external services like Make.com
+# Allow cross-origin requests (e.g., from Make.com)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,7 +16,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# AWS credentials from environment variables
+# Load AWS credentials from environment
 aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
 aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
 aws_region = os.getenv("AWS_DEFAULT_REGION", "eu-central-1")
@@ -48,4 +48,8 @@ async def process_receipt(request: Request):
         )
 
         print("✅ Textract analysis complete.")
-        re
+        return JSONResponse(content=response, status_code=200)
+
+    except Exception as e:
+        print(f"🔥 Error during processing: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
