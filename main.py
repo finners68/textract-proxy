@@ -4,13 +4,15 @@ import base64
 import uuid
 import logging
 import time
+from io import BytesIO
+import fitz  # PyMuPDF
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from botocore.exceptions import ClientError, BotoCoreError
 from typing import Dict
 
-# App setup
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,7 +43,7 @@ textract = boto3.client(
 
 # Input model
 class ReceiptUpload(BaseModel):
-    file: str  # base64-encoded PDF string
+    file: str  # base64-encoded PDF
 
 @app.post("/process-receipt")
 def process_receipt(data: ReceiptUpload):
@@ -51,13 +53,12 @@ def process_receipt(data: ReceiptUpload):
         b64 = data.file.strip()
         logger.info(f"📦 Base64 input starts: {b64[:40]}...")
 
-        # Remove base64 URI prefix if present
         if "," in b64:
             b64 = b64.split(",", 1)[1]
 
         try:
             file_bytes = base64.b64decode(b64)
-        except Exception as e:
+        except Exception:
             logger.exception("❌ Base64 decoding failed")
             return JSONResponse(status_code=400, content={"error": "Invalid base64 input."})
 
@@ -68,7 +69,20 @@ def process_receipt(data: ReceiptUpload):
             logger.error("❌ File does not start with %PDF")
             return JSONResponse(status_code=400, content={"error": "Uploaded file is not a valid PDF."})
 
-        logger.info("✅ File passed PDF validation. Uploading to S3...")
+        # 🧼 Flatten PDF to fix unsupported encoding issues
+        logger.info("🧼 Flattening PDF using PyMuPDF...")
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            flattened_pdf = BytesIO()
+            doc.save(flattened_pdf)
+            flattened_pdf.seek(0)
+            file_bytes = flattened_pdf.read()
+            doc.close()
+        except Exception:
+            logger.exception("❌ Failed to flatten PDF")
+            return JSONResponse(status_code=500, content={"error": "PDF flattening failed"})
+
+        logger.info(f"📄 Flattened PDF size: {len(file_bytes)} bytes")
 
         filename = f"{uuid.uuid4()}.pdf"
         s3.put_object(
@@ -109,7 +123,7 @@ def process_receipt(data: ReceiptUpload):
         logger.exception("Unhandled error in receipt processing")
         return JSONResponse(status_code=500, content={"error": f"Internal error: {str(e)}"})
 
-# Extract fields from Textract blocks
+# Textract field extraction
 def extract_fields(blocks) -> Dict[str, str]:
     block_map = {b['Id']: b for b in blocks}
     key_map = {}
@@ -142,7 +156,7 @@ def extract_fields(blocks) -> Dict[str, str]:
 
     return results
 
-# Helper to extract visible text from block
+# Helper: get visible text from block
 def get_text(block, block_map):
     if not block or "Relationships" not in block:
         return ""
@@ -155,7 +169,7 @@ def get_text(block, block_map):
                     words.append(word.get("Text", ""))
     return " ".join(words)
 
-# Optional health check route
+# Health check route
 @app.get("/health")
 def health():
     return {"status": "ok"}
