@@ -3,6 +3,7 @@ import base64
 import os
 import uuid
 import logging
+import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
@@ -59,8 +60,17 @@ async def process_receipt(request: Request):
             logger.error(f"Failed to decode base64: {str(e)}")
             return JSONResponse(status_code=400, content={"error": "Base64 decoding failed."})
 
-        # Upload to S3
-        s3_client.put_object(Bucket=S3_BUCKET, Key=filename, Body=file_bytes)
+        # Upload to S3 with correct content type
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=filename,
+            Body=file_bytes,
+            ContentType='application/pdf'
+        )
+
+        # Wait to ensure file is available
+        time.sleep(10)
+        s3_client.head_object(Bucket=S3_BUCKET, Key=filename)
 
         # Textract call
         response = textract_client.analyze_document(
