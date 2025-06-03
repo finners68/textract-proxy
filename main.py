@@ -69,7 +69,6 @@ def process_receipt(data: ReceiptUpload):
             logger.error("❌ File does not start with %PDF")
             return JSONResponse(status_code=400, content={"error": "Uploaded file is not a valid PDF."})
 
-        # 🧼 Flatten PDF to fix unsupported encoding issues
         logger.info("🧼 Flattening PDF using PyMuPDF...")
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -101,24 +100,32 @@ def process_receipt(data: ReceiptUpload):
         else:
             return JSONResponse(status_code=504, content={"error": "S3 object not found after upload."})
 
-        logger.info("🧠 Calling Textract...")
-        response = textract.analyze_document(
-            Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}},
+        logger.info("⏳ Starting async Textract job...")
+        response = textract.start_document_analysis(
+            DocumentLocation={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}},
             FeatureTypes=["FORMS"]
         )
+        job_id = response["JobId"]
+        logger.info(f"📄 Textract JobId: {job_id}")
 
-        fields = extract_fields(response['Blocks'])
+        # Poll for completion
+        while True:
+            result = textract.get_document_analysis(JobId=job_id)
+            status = result["JobStatus"]
+            logger.info(f"🌀 Job status: {status}")
+            if status == "SUCCEEDED":
+                break
+            elif status == "FAILED":
+                return JSONResponse(status_code=500, content={"error": "Textract analysis failed."})
+            time.sleep(2)
+
+        fields = extract_fields(result['Blocks'])
         logger.info(f"✅ Extracted {len(fields)} fields from document")
         return {"fields": fields}
-
-    except textract.exceptions.UnsupportedDocumentException:
-        logger.exception("❌ Textract rejected the document")
-        return JSONResponse(status_code=400, content={"error": "Unsupported document format (Textract)."})
 
     except (ClientError, BotoCoreError) as e:
         logger.exception("AWS client error")
         return JSONResponse(status_code=502, content={"error": f"AWS error: {str(e)}"})
-
     except Exception as e:
         logger.exception("Unhandled error in receipt processing")
         return JSONResponse(status_code=500, content={"error": f"Internal error: {str(e)}"})
@@ -156,7 +163,7 @@ def extract_fields(blocks) -> Dict[str, str]:
 
     return results
 
-# Helper: get visible text from block
+# Helper: extract visible text from a block
 def get_text(block, block_map):
     if not block or "Relationships" not in block:
         return ""
@@ -169,7 +176,6 @@ def get_text(block, block_map):
                     words.append(word.get("Text", ""))
     return " ".join(words)
 
-# Health check route
 @app.get("/health")
 def health():
     return {"status": "ok"}
