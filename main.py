@@ -85,102 +85,29 @@ def process_receipt(data: ReceiptUpload):
         filename = f"{uuid.uuid4()}.pdf"
         s3.put_object(Bucket=S3_BUCKET, Key=filename, Body=file_bytes, ContentType="application/pdf")
 
-        logger.info("\U0001F9E0 Calling Textract async analyze_document...")
-        start_response = textract.start_document_analysis(
-            DocumentLocation={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}},
-            FeatureTypes=["FORMS"]
-        )
+        logger.info("\U0001F9E0 Calling Textract (analyze_expense)...")
+        try:
+            response = textract.analyze_expense(
+                Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}}
+            )
 
-        job_id = start_response["JobId"]
-        logger.info(f"\U0001F4CB Textract Job ID: {job_id}")
+            fields = {}
+            for doc in response.get('ExpenseDocuments', []):
+                for field in doc.get('SummaryFields', []):
+                    type_text = field.get('Type', {}).get('Text', '').upper()
+                    value = field.get('ValueDetection', {}).get('Text', '')
+                    if type_text and value:
+                        fields[type_text] = value
 
-        # Poll for job completion
-        while True:
-            result = textract.get_document_analysis(JobId=job_id)
-            status = result["JobStatus"]
-            if status == "SUCCEEDED":
-                break
-            elif status == "FAILED":
-                return JSONResponse(status_code=500, content={"error": "Textract analysis failed."})
-            time.sleep(2)
+            return {"fields": fields}
 
-        fields = extract_vat_fields(result["Blocks"])
-        return {"fields": fields}
+        except textract.exceptions.UnsupportedDocumentException:
+            logger.error("\u274C Textract rejected the document")
+            return JSONResponse(status_code=400, content={"error": "Unsupported document format."})
 
     except Exception as e:
         logger.exception("Unhandled error in receipt processing")
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-def extract_vat_fields(blocks):
-    block_map = {b['Id']: b for b in blocks}
-    key_map = {}
-    value_map = {}
-    results = {}
-    vat_number = None
-    total = None
-    tax = None
-
-    for block in blocks:
-        if block['BlockType'] == 'KEY_VALUE_SET':
-            if 'KEY' in block.get('EntityTypes', []):
-                key_map[block['Id']] = block
-            else:
-                value_map[block['Id']] = block
-
-    for key_id, key_block in key_map.items():
-        key_text = get_text(key_block, block_map).lower()
-        val_id = key_block.get("Relationships", [{}])[0].get("Ids", [None])[0]
-        val_text = get_text(value_map.get(val_id, {}), block_map) if val_id else ""
-
-        if "total" in key_text:
-            total = parse_currency(val_text)
-            results['TOTAL'] = total
-        elif "tax" in key_text or "vat" in key_text:
-            tax = parse_currency(val_text)
-            results['VAT_AMOUNT'] = tax
-        elif "date" in key_text:
-            results['DATE'] = val_text
-        elif "invoice" in key_text:
-            results['INVOICE_NO'] = val_text
-        elif "vendor" in key_text or "seller" in key_text:
-            results['VENDOR'] = val_text
-
-        if not vat_number:
-            match = re.search(r'\bGB\d{9}\b', val_text)
-            if match:
-                vat_number = match.group()
-
-    if vat_number:
-        results['VAT_NUMBER'] = vat_number
-
-    if tax and total and total > 0:
-        vat_rate = round((tax / total) * 100, 2)
-        results['VAT_RATE'] = f"{vat_rate}%"
-
-    return results
-
-
-def get_text(block, block_map):
-    if not block or "Relationships" not in block:
-        return ""
-    words = []
-    for rel in block["Relationships"]:
-        if rel["Type"] == "CHILD":
-            for id in rel["Ids"]:
-                word = block_map.get(id)
-                if word and word.get("BlockType") == "WORD":
-                    words.append(word.get("Text", ""))
-    return " ".join(words)
-
-
-def parse_currency(value):
-    value = value.replace(",", "").replace("£", "").strip()
-    try:
-        return float(re.findall(r"\d+\.\d{2}", value)[0])
-    except:
-        return None
-
 
 @app.get("/health")
 def health():
