@@ -1,28 +1,41 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import boto3
 import base64
 import os
+import uuid
+import logging
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Allow cross-origin requests (e.g., from Make.com)
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Load AWS credentials from environment
-aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
-aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-aws_region = os.getenv("AWS_DEFAULT_REGION", "eu-central-1")
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")
+AWS_REGION = os.environ.get("AWS_REGION")
+S3_BUCKET = os.environ.get("S3_BUCKET")
 
-# Initialize Textract client
-textract = boto3.client(
+# Boto3 clients
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION,
+)
+
+textract_client = boto3.client(
     "textract",
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
@@ -33,23 +46,30 @@ textract = boto3.client(
 async def process_receipt(request: Request):
     try:
         body = await request.json()
-        base64_file = body.get("file")
+        if 'file' not in body:
+            raise ValueError("Missing 'file' in request body.")
+        
+        file_data_base64 = body['file']
+        filename = f"{uuid.uuid4()}.pdf"
 
-        if not base64_file:
-            print("❌ Missing 'file' in request body.")
-            raise HTTPException(status_code=400, detail="Missing 'file' in request body.")
+        # Decode base64
+        try:
+            file_bytes = base64.b64decode(file_data_base64)
+        except Exception as e:
+            logger.error(f"Failed to decode base64: {str(e)}")
+            return JSONResponse(status_code=400, content={"error": "Base64 decoding failed."})
 
-        file_bytes = base64.b64decode(base64_file)
-        print("📤 File received and decoded successfully.")
+        # Upload to S3
+        s3_client.put_object(Bucket=S3_BUCKET, Key=filename, Body=file_bytes)
 
-        response = textract.analyze_document(
-            Document={"Bytes": file_bytes},
+        # Textract call
+        response = textract_client.analyze_document(
+            Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}},
             FeatureTypes=["FORMS"]
         )
 
-        print("✅ Textract analysis complete.")
-        return JSONResponse(content=response, status_code=200)
+        return JSONResponse(status_code=200, content=response)
 
     except Exception as e:
-        print(f"🔥 Error during processing: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.exception("🔥 Error during processing")
+        return JSONResponse(status_code=500, content={"error": str(e)})
