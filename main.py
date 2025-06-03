@@ -110,26 +110,7 @@ def process_receipt(data: ReceiptUpload):
                     if type_text and value:
                         raw_fields[type_text] = value
 
-            # Normalize for VAT compliance
-            normalized = {
-                "vendor_name": raw_fields.get("VENDOR_NAME") or raw_fields.get("SUPPLIER") or None,
-                "total_amount": raw_fields.get("TOTAL") or raw_fields.get("INVOICE_TOTAL") or None,
-                "subtotal_amount": raw_fields.get("SUBTOTAL") or raw_fields.get("AMOUNT_BEFORE_TAX") or None,
-                "vat_amount": raw_fields.get("TAX") or raw_fields.get("VAT") or None,
-                "vat_rate_percent": None,
-                "currency": raw_fields.get("CURRENCY") or None,
-                "invoice_date": raw_fields.get("INVOICE_RECEIPT_DATE") or raw_fields.get("DATE") or None
-            }
-
-            # Attempt to extract VAT % if embedded in any field
-            for k, v in raw_fields.items():
-                if re.search(r"(vat|tax).+\%", k, re.IGNORECASE) or re.search(r"\d+\.?\d*\s*%", v):
-                    match = re.search(r"(\d+\.?\d*)\s*%", v)
-                    if match:
-                        normalized["vat_rate_percent"] = match.group(1)
-                        break
-
-            return {"fields": normalized}
+            return {"raw_fields": raw_fields}
 
         except textract.exceptions.UnsupportedDocumentException:
             logger.error("\u274C Textract rejected the document")
