@@ -68,24 +68,21 @@ def process_receipt(data: ReceiptUpload):
             logger.error("\u274C File does not start with %PDF")
             return JSONResponse(status_code=400, content={"error": "Uploaded file is not a valid PDF."})
 
-        logger.info("\U0001F9FC Flattening PDF using PyMuPDF...")
+        logger.info("\U0001F5FC Rendering PDF as PNG image...")
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            flattened_pdf = BytesIO()
-            doc.save(flattened_pdf)
-            flattened_pdf.seek(0)
-            file_bytes = flattened_pdf.read()
+            page = doc.load_page(0)  # first page
+            pix = page.get_pixmap(dpi=300)
+            img_data = pix.tobytes("png")
             doc.close()
         except Exception:
-            logger.exception("\u274C Failed to flatten PDF")
-            return JSONResponse(status_code=500, content={"error": "PDF flattening failed"})
+            logger.exception("\u274C Failed to convert PDF to image")
+            return JSONResponse(status_code=500, content={"error": "PDF to image conversion failed"})
 
-        logger.info(f"\U0001F4C4 Flattened PDF size: {len(file_bytes)} bytes")
+        filename = f"{uuid.uuid4()}.png"
+        s3.put_object(Bucket=S3_BUCKET, Key=filename, Body=img_data, ContentType="image/png")
 
-        filename = f"{uuid.uuid4()}.pdf"
-        s3.put_object(Bucket=S3_BUCKET, Key=filename, Body=file_bytes, ContentType="application/pdf")
-
-        logger.info("\U0001F9E0 Calling Textract (analyze_expense)...")
+        logger.info("\U0001F9E0 Calling Textract (analyze_expense) on image...")
         try:
             response = textract.analyze_expense(
                 Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}}
@@ -102,7 +99,7 @@ def process_receipt(data: ReceiptUpload):
             return {"fields": fields}
 
         except textract.exceptions.UnsupportedDocumentException:
-            logger.error("\u274C Textract rejected the document")
+            logger.error("\u274C Textract rejected the image document")
             return JSONResponse(status_code=400, content={"error": "Unsupported document format."})
 
     except Exception as e:
