@@ -9,10 +9,10 @@ from botocore.exceptions import ClientError, BotoCoreError
 app = FastAPI()
 
 # Load AWS credentials and config
-aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
-aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+aws_access_key = os.getenv("AWS_ACCESS_KEY")
+aws_secret_key = os.getenv("AWS_SECRET_KEY")
 aws_region = os.getenv("AWS_REGION")
-s3_bucket = os.getenv("S3_BUCKET_NAME")
+s3_bucket = os.getenv("S3_BUCKET")
 
 if not all([aws_access_key, aws_secret_key, aws_region, s3_bucket]):
     raise EnvironmentError("Missing one or more AWS environment variables.")
