@@ -91,36 +91,13 @@ def process_receipt(data: ReceiptUpload):
             ContentType="application/pdf"
         )
 
-        for _ in range(10):
-            try:
-                s3.head_object(Bucket=S3_BUCKET, Key=filename)
-                break
-            except ClientError:
-                time.sleep(1)
-        else:
-            return JSONResponse(status_code=504, content={"error": "S3 object not found after upload."})
-
-        logger.info("⏳ Starting async Textract job...")
-        response = textract.start_document_analysis(
-            DocumentLocation={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}},
-            FeatureTypes=["FORMS"]
+        logger.info("🧠 Calling Textract (analyze_expense)...")
+        response = textract.analyze_expense(
+            Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}}
         )
-        job_id = response["JobId"]
-        logger.info(f"📄 Textract JobId: {job_id}")
 
-        # Poll for completion
-        while True:
-            result = textract.get_document_analysis(JobId=job_id)
-            status = result["JobStatus"]
-            logger.info(f"🌀 Job status: {status}")
-            if status == "SUCCEEDED":
-                break
-            elif status == "FAILED":
-                return JSONResponse(status_code=500, content={"error": "Textract analysis failed."})
-            time.sleep(2)
-
-        fields = extract_fields(result['Blocks'])
-        logger.info(f"✅ Extracted {len(fields)} fields from document")
+        fields = extract_expense_fields(response)
+        logger.info(f"✅ Extracted {len(fields)} fields from expense document")
         return {"fields": fields}
 
     except (ClientError, BotoCoreError) as e:
@@ -130,51 +107,16 @@ def process_receipt(data: ReceiptUpload):
         logger.exception("Unhandled error in receipt processing")
         return JSONResponse(status_code=500, content={"error": f"Internal error: {str(e)}"})
 
-# Textract field extraction
-def extract_fields(blocks) -> Dict[str, str]:
-    block_map = {b['Id']: b for b in blocks}
-    key_map = {}
-    value_map = {}
-
-    for block in blocks:
-        if block['BlockType'] == 'KEY_VALUE_SET':
-            if 'KEY' in block.get('EntityTypes', []):
-                key_map[block['Id']] = block
-            elif 'VALUE' in block.get('EntityTypes', []):
-                value_map[block['Id']] = block
-
-    results = {}
-    for key_id, key_block in key_map.items():
-        key_text = get_text(key_block, block_map)
-        if not key_text:
-            continue
-
-        value_texts = []
-        for rel in key_block.get("Relationships", []):
-            if rel["Type"] == "VALUE":
-                for val_id in rel.get("Ids", []):
-                    val_block = value_map.get(val_id)
-                    val_text = get_text(val_block, block_map)
-                    if val_text:
-                        value_texts.append(val_text)
-
-        if value_texts:
-            results[key_text] = " | ".join(value_texts)
-
-    return results
-
-# Helper: extract visible text from a block
-def get_text(block, block_map):
-    if not block or "Relationships" not in block:
-        return ""
-    words = []
-    for rel in block["Relationships"]:
-        if rel["Type"] == "CHILD":
-            for id in rel["Ids"]:
-                word = block_map.get(id)
-                if word and word.get("BlockType") == "WORD":
-                    words.append(word.get("Text", ""))
-    return " ".join(words)
+# Extract fields from analyze_expense
+def extract_expense_fields(response) -> Dict[str, str]:
+    fields = {}
+    for doc in response.get("ExpenseDocuments", []):
+        for field in doc.get("SummaryFields", []):
+            key = field.get("Type", {}).get("Text", "").strip()
+            value = field.get("ValueDetection", {}).get("Text", "").strip()
+            if key and value:
+                fields[key] = value
+    return fields
 
 @app.get("/health")
 def health():
