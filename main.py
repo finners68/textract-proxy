@@ -10,11 +10,12 @@ from pydantic import BaseModel
 from botocore.exceptions import ClientError, BotoCoreError
 from typing import Dict
 
+# App setup
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# AWS config
+# AWS configuration
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
 AWS_REGION = os.getenv("AWS_REGION")
@@ -40,7 +41,7 @@ textract = boto3.client(
 
 # Input model
 class ReceiptUpload(BaseModel):
-    file: str  # base64-encoded PDF
+    file: str  # base64-encoded PDF string
 
 @app.post("/process-receipt")
 def process_receipt(data: ReceiptUpload):
@@ -50,6 +51,7 @@ def process_receipt(data: ReceiptUpload):
         b64 = data.file.strip()
         logger.info(f"📦 Base64 input starts: {b64[:40]}...")
 
+        # Remove base64 URI prefix if present
         if "," in b64:
             b64 = b64.split(",", 1)[1]
 
@@ -68,14 +70,92 @@ def process_receipt(data: ReceiptUpload):
 
         logger.info("✅ File passed PDF validation. Uploading to S3...")
 
-        # TEMP: stop here to validate PDF and base64 only
-        return JSONResponse(status_code=200, content={"message": "PDF looks good!"})
+        filename = f"{uuid.uuid4()}.pdf"
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=filename,
+            Body=file_bytes,
+            ContentType="application/pdf"
+        )
+
+        for _ in range(10):
+            try:
+                s3.head_object(Bucket=S3_BUCKET, Key=filename)
+                break
+            except ClientError:
+                time.sleep(1)
+        else:
+            return JSONResponse(status_code=504, content={"error": "S3 object not found after upload."})
+
+        logger.info("🧠 Calling Textract...")
+        response = textract.analyze_document(
+            Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': filename}},
+            FeatureTypes=["FORMS"]
+        )
+
+        fields = extract_fields(response['Blocks'])
+        logger.info(f"✅ Extracted {len(fields)} fields from document")
+        return {"fields": fields}
+
+    except textract.exceptions.UnsupportedDocumentException:
+        logger.exception("❌ Textract rejected the document")
+        return JSONResponse(status_code=400, content={"error": "Unsupported document format (Textract)."})
+
+    except (ClientError, BotoCoreError) as e:
+        logger.exception("AWS client error")
+        return JSONResponse(status_code=502, content={"error": f"AWS error: {str(e)}"})
 
     except Exception as e:
         logger.exception("Unhandled error in receipt processing")
         return JSONResponse(status_code=500, content={"error": f"Internal error: {str(e)}"})
 
-# Optional health route for testing
+# Extract fields from Textract blocks
+def extract_fields(blocks) -> Dict[str, str]:
+    block_map = {b['Id']: b for b in blocks}
+    key_map = {}
+    value_map = {}
+
+    for block in blocks:
+        if block['BlockType'] == 'KEY_VALUE_SET':
+            if 'KEY' in block.get('EntityTypes', []):
+                key_map[block['Id']] = block
+            elif 'VALUE' in block.get('EntityTypes', []):
+                value_map[block['Id']] = block
+
+    results = {}
+    for key_id, key_block in key_map.items():
+        key_text = get_text(key_block, block_map)
+        if not key_text:
+            continue
+
+        value_texts = []
+        for rel in key_block.get("Relationships", []):
+            if rel["Type"] == "VALUE":
+                for val_id in rel.get("Ids", []):
+                    val_block = value_map.get(val_id)
+                    val_text = get_text(val_block, block_map)
+                    if val_text:
+                        value_texts.append(val_text)
+
+        if value_texts:
+            results[key_text] = " | ".join(value_texts)
+
+    return results
+
+# Helper to extract visible text from block
+def get_text(block, block_map):
+    if not block or "Relationships" not in block:
+        return ""
+    words = []
+    for rel in block["Relationships"]:
+        if rel["Type"] == "CHILD":
+            for id in rel["Ids"]:
+                word = block_map.get(id)
+                if word and word.get("BlockType") == "WORD":
+                    words.append(word.get("Text", ""))
+    return " ".join(words)
+
+# Optional health check route
 @app.get("/health")
 def health():
     return {"status": "ok"}
