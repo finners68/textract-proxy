@@ -1,125 +1,138 @@
 import os
-import uuid
+import io
+import json
 import base64
 import logging
-import time
-from io import BytesIO
 import fitz  # PyMuPDF
 import boto3
-import re
-
-from fastapi import FastAPI
+import uuid
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
-# Logging setup
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-# Environment variables
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
-AWS_REGION = os.getenv("AWS_REGION")
-S3_BUCKET = os.getenv("S3_BUCKET")
+app = FastAPI()
+
+# CORS for local/testing use
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# AWS Credentials
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")
+AWS_REGION = os.environ.get("AWS_REGION")
+S3_BUCKET = os.environ.get("S3_BUCKET")
 
 if not all([AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, S3_BUCKET]):
     raise EnvironmentError("Missing one or more AWS environment variables.")
 
 # AWS Clients
-s3 = boto3.client("s3",
+s3 = boto3.client(
+    "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
+    region_name=AWS_REGION,
 )
 
-textract = boto3.client("textract",
+textract = boto3.client(
+    "textract",
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
+    region_name=AWS_REGION,
 )
-
-# FastAPI app
-app = FastAPI()
-
-class ReceiptUpload(BaseModel):
-    file: str  # base64-encoded file (PDF, PNG, or JPG)
 
 @app.post("/process-receipt")
-def process_receipt(data: ReceiptUpload):
-    logger.info("\U0001F4E5 Received request to /process-receipt")
-
+async def process_receipt(request: Request):
     try:
-        b64 = data.file.strip()
-        logger.info(f"\U0001F4E6 Base64 input starts: {b64[:40]}...")
+        logger.info("📥 Received request to /process-receipt")
 
-        if "," in b64:
-            b64 = b64.split(",", 1)[1]
+        body = await request.json()
+        if "file" not in body:
+            return JSONResponse(status_code=400, content={"error": "Missing 'file' in request body."})
+
+        base64_file = body["file"]
+        logger.info(f"📦 Base64 input starts: {{base64_file[:30]}}...")
 
         try:
-            file_bytes = base64.b64decode(b64)
-        except Exception:
-            logger.exception("\u274C Base64 decoding failed")
-            return JSONResponse(status_code=400, content={"error": "Invalid base64 input."})
+            file_bytes = base64.b64decode(base64_file)
+            logger.info(f"📄 Decoded file size: {len(file_bytes)} bytes")
+            logger.info(f"📄 First 10 bytes: {file_bytes[:10]!r}")
+        except Exception as e:
+            logger.error("❌ Failed to decode base64", exc_info=True)
+            return JSONResponse(status_code=400, content={"error": "Invalid base64 string."})
 
-        logger.info(f"\U0001F4C4 Decoded file size: {len(file_bytes)} bytes")
-        logger.info(f"\U0001F4C4 First 10 bytes: {file_bytes[:10]}")
-
-        # Detect file type
-        content_type = None
-        if file_bytes.startswith(b"%PDF"):
-            content_type = "application/pdf"
-        elif file_bytes.startswith(b"\x89PNG"):
-            content_type = "image/png"
-        elif file_bytes.startswith(b"\xff\xd8\xff"):
-            content_type = "image/jpeg"
-        else:
-            logger.error("\u274C Unsupported file format")
-            return JSONResponse(status_code=400, content={"error": "Unsupported file format. Only PDF, PNG, and JPEG are supported."})
-
-        # Process PDF: convert to PNG
-        if content_type == "application/pdf":
-            logger.info("\U0001F5FC Rendering PDF as PNG image...")
-            try:
-                doc = fitz.open(stream=file_bytes, filetype="pdf")
-                page = doc.load_page(0)
-                pix = page.get_pixmap(dpi=300)
-                file_bytes = pix.tobytes("png")
-                content_type = "image/png"
-                doc.close()
-            except Exception:
-                logger.exception("\u274C Failed to convert PDF to image")
-                return JSONResponse(status_code=500, content={"error": "PDF to image conversion failed"})
-
-        # Upload file to S3
-        filename = f"{uuid.uuid4()}"
-        ext = ".png" if content_type == "image/png" else ".jpg"
-        key = f"{filename}{ext}"
-        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=file_bytes, ContentType=content_type)
-
-        logger.info("\U0001F9E0 Calling Textract (analyze_expense)...")
+        # Flatten PDF to image
         try:
-            response = textract.analyze_expense(
-                Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': key}}
+            logger.info("🧼 Flattening PDF using PyMuPDF...")
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            page = doc.load_page(0)  # only first page for now
+            pix = page.get_pixmap(dpi=300)
+            image_bytes = pix.tobytes("png")
+            logger.info(f"📄 Flattened PDF size: {len(image_bytes)} bytes")
+        except Exception as e:
+            logger.error("❌ PDF flattening failed", exc_info=True)
+            return JSONResponse(status_code=400, content={"error": "Could not flatten PDF."})
+
+        # Upload image to S3
+        filename = f"receipt-{uuid.uuid4()}.png"
+        try:
+            logger.info("☁️ Uploading image to S3...")
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=filename,
+                Body=image_bytes,
+                ContentType="image/png",
             )
+        except Exception as e:
+            logger.error("❌ Failed to upload to S3", exc_info=True)
+            return JSONResponse(status_code=500, content={"error": "S3 upload failed."})
 
-            raw_fields = {}
-            for doc in response.get('ExpenseDocuments', []):
-                for field in doc.get('SummaryFields', []):
-                    type_text = field.get('Type', {}).get('Text', '').upper()
-                    value = field.get('ValueDetection', {}).get('Text', '')
-                    if type_text and value:
-                        raw_fields[type_text] = value
-
-            return {"raw_fields": raw_fields}
-
-        except textract.exceptions.UnsupportedDocumentException:
-            logger.error("\u274C Textract rejected the document")
+        # Call Textract AnalyzeExpense
+        try:
+            logger.info("🧠 Calling Textract (analyze_expense)...")
+            response = textract.analyze_expense(
+                Document={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}}
+            )
+        except Exception as e:
+            logger.error("❌ Textract rejected the document", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Unsupported document format."})
 
-    except Exception as e:
-        logger.exception("Unhandled error in receipt processing")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        # Extract raw fields
+        raw_fields = {}
+        for doc in response.get("ExpenseDocuments", []):
+            for field in doc.get("SummaryFields", []):
+                if "Type" in field and "ValueDetection" in field:
+                    field_name = field["Type"].get("Text", "").strip().upper().replace(" ", "_")
+                    field_value = field["ValueDetection"].get("Text", "").strip()
+                    if field_name and field_value:
+                        raw_fields[field_name] = field_value
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+        # Extract line items
+        line_items = []
+        for doc in response.get("ExpenseDocuments", []):
+            for group in doc.get("LineItemGroups", []):
+                for item in group.get("LineItems", []):
+                    fields = {
+                        f['Type']['Text'].lower(): f['ValueDetection']['Text']
+                        for f in item.get('LineItemExpenseFields', [])
+                        if 'Type' in f and 'ValueDetection' in f
+                    }
+                    if fields:
+                        line_items.append(fields)
+
+        return JSONResponse(status_code=200, content={
+            "raw_fields": raw_fields,
+            "line_items": line_items
+        })
+
+    except Exception as e:
+        logger.error("🔥 Unhandled exception during /process-receipt", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "Internal server error."})
