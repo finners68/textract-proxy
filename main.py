@@ -5,6 +5,7 @@ import base64
 import logging
 import fitz  # PyMuPDF
 import boto3
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -82,9 +83,9 @@ async def process_receipt(request: Request):
             logger.error("❌ PDF flattening failed", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Could not flatten PDF."})
 
-        # Sanitize and enforce .png extension
+        # Keep original name prefix, append UUID, enforce .png
         filename_base = os.path.splitext(original_filename)[0]
-        filename = f"{filename_base}.png"
+        filename = f"{filename_base}-{uuid.uuid4()}.png"
 
         # Upload image to S3
         try:
