@@ -3,7 +3,6 @@ import io
 import json
 import base64
 import logging
-import tempfile
 import fitz  # PyMuPDF
 import boto3
 import uuid
@@ -11,10 +10,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
 app = FastAPI()
+
+# CORS for local/testing use
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,21 +25,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# AWS Credentials
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")
 AWS_REGION = os.environ.get("AWS_REGION")
 S3_BUCKET = os.environ.get("S3_BUCKET")
-FLATTEN_DPI = int(os.environ.get("PDF_FLATTEN_DPI", "200"))  # was 300. make it tunable
 
 if not all([AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, S3_BUCKET]):
     raise EnvironmentError("Missing one or more AWS environment variables.")
 
+# AWS Clients
 s3 = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
     region_name=AWS_REGION,
 )
+
 textract = boto3.client(
     "textract",
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -45,12 +49,27 @@ textract = boto3.client(
     region_name=AWS_REGION,
 )
 
+# Helper to detect type from magic bytes
+def sniff_kind(header: bytes):
+    h = header[:64]
+    if h.startswith(b"%PDF-"):
+        return ("pdf", ".pdf", "application/pdf")
+    if h.startswith(b"\xFF\xD8\xFF"):
+        return ("jpeg", ".jpg", "image/jpeg")
+    if h.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ("png", ".png", "image/png")
+    if h.startswith(b"II*\x00") or h.startswith(b"MM\x00*"):
+        return ("tiff", ".tiff", "image/tiff")
+    # common HEIC signatures
+    if b"ftypheic" in h or b"ftypheif" in h or b"ftypmif1" in h:
+        return ("heic", ".heic", "image/heic")
+    return (None, None, None)
+
 @app.post("/process-receipt")
 async def process_receipt(request: Request):
-    pdf_path = None
-    png_path = None
     try:
         logger.info("📥 Received request to /process-receipt")
+
         body = await request.json()
         if "file" not in body or "filename" not in body:
             return JSONResponse(status_code=400, content={"error": "Missing 'file' or 'filename' in request body."})
@@ -58,54 +77,64 @@ async def process_receipt(request: Request):
         base64_file = body["file"]
         original_filename = body["filename"]
 
-        # Strip data URL prefix if present
-        if base64_file.startswith("data:"):
+        # Support data URLs
+        if isinstance(base64_file, str) and base64_file.startswith("data:"):
             base64_file = base64_file.split(",", 1)[1]
 
-        # 1) Stream-decode base64 to a temp PDF on disk
+        # Decode
         try:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
-                pdf_path = tmp_pdf.name
-                src = io.BytesIO(base64_file.encode("ascii"))
-                base64.decode(src, tmp_pdf)  # no giant in-memory bytes
-            pdf_size = os.path.getsize(pdf_path)
-            logger.info(f"📄 Decoded PDF size on disk: {pdf_size} bytes")
+            file_bytes = base64.b64decode(base64_file)
+            logger.info(f"📄 Decoded size: {len(file_bytes)} bytes")
         except Exception:
-            logger.error("❌ Failed to decode base64 to PDF", exc_info=True)
+            logger.error("❌ Failed to decode base64", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Invalid base64 string."})
 
-        # 2) Flatten first page to PNG written directly to disk
-        try:
-            logger.info(f"🧼 Flattening PDF with PyMuPDF at {FLATTEN_DPI} DPI...")
-            doc = fitz.open(pdf_path)
-            page = doc.load_page(0)
-            pix = page.get_pixmap(dpi=FLATTEN_DPI, alpha=False)  # avoid RGBA
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_png:
-                png_path = tmp_png.name
-            pix.save(png_path)  # write file, do not build image_bytes
-            doc.close()
-            png_size = os.path.getsize(png_path)
-            logger.info(f"🖼️ PNG on disk size: {png_size} bytes")
-        except Exception:
-            logger.error("❌ PDF flattening failed", exc_info=True)
-            return JSONResponse(status_code=400, content={"error": "Could not flatten PDF."})
+        # Detect file type
+        kind, ext, content_type = sniff_kind(file_bytes[:64])
+        if kind is None:
+            return JSONResponse(status_code=415, content={"error": "Unsupported file type. Use PDF, JPEG, PNG, or TIFF."})
+        if kind == "heic":
+            return JSONResponse(status_code=415, content={"error": "HEIC is not supported. Convert to JPEG or PDF."})
 
-        # 3) Upload PNG by streaming from disk
+        # Build S3 key
+        filename_base = os.path.splitext(original_filename)[0]
+
+        # If image, upload as-is. If PDF, flatten first page to PNG like your current flow.
+        if kind in ("jpeg", "png", "tiff"):
+            filename = f"{filename_base}-{uuid.uuid4()}{ext}"
+            image_bytes = file_bytes
+            ct = content_type
+            logger.info(f"🖼️ Detected image: {kind} -> uploading as-is")
+        else:
+            try:
+                logger.info("🧼 Flattening PDF using PyMuPDF...")
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                page = doc.load_page(0)
+                # Lower DPI and no alpha to reduce memory. Bump if needed.
+                pix = page.get_pixmap(dpi=150, alpha=False)
+                image_bytes = pix.tobytes("png")
+                doc.close()
+                filename = f"{filename_base}-{uuid.uuid4()}.png"
+                ct = "image/png"
+                logger.info(f"📄 Flattened PNG bytes: {len(image_bytes)}")
+            except Exception:
+                logger.error("❌ PDF flattening failed", exc_info=True)
+                return JSONResponse(status_code=400, content={"error": "Could not flatten PDF."})
+
+        # Upload to S3
         try:
-            filename_base = os.path.splitext(original_filename)[0]
-            filename = f"{filename_base}-{uuid.uuid4()}.png"
-            logger.info(f"☁️ Uploading image to S3 as: {filename}")
-            s3.upload_file(
-                Filename=png_path,
+            logger.info(f"☁️ Uploading to S3 as: {filename} ({ct})")
+            s3.put_object(
                 Bucket=S3_BUCKET,
                 Key=filename,
-                ExtraArgs={"ContentType": "image/png"},
+                Body=image_bytes,
+                ContentType=ct,
             )
         except Exception:
             logger.error("❌ Failed to upload to S3", exc_info=True)
             return JSONResponse(status_code=500, content={"error": "S3 upload failed."})
 
-        # 4) Call Textract AnalyzeExpense unchanged
+        # Call Textract AnalyzeExpense
         try:
             logger.info("🧠 Calling Textract (analyze_expense)...")
             response = textract.analyze_expense(
@@ -146,11 +175,3 @@ async def process_receipt(request: Request):
     except Exception:
         logger.error("🔥 Unhandled exception during /process-receipt", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Internal server error."})
-    finally:
-        # Cleanup temp files
-        for p in (pdf_path, png_path):
-            try:
-                if p and os.path.exists(p):
-                    os.unlink(p)
-            except Exception:
-                pass
