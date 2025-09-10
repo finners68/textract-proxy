@@ -3,6 +3,7 @@ import io
 import json
 import base64
 import logging
+import tempfile
 import fitz  # PyMuPDF
 import boto3
 import uuid
@@ -10,13 +11,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
 app = FastAPI()
-
-# CORS for local/testing use
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,23 +23,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# AWS Credentials
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")
 AWS_REGION = os.environ.get("AWS_REGION")
 S3_BUCKET = os.environ.get("S3_BUCKET")
+FLATTEN_DPI = int(os.environ.get("PDF_FLATTEN_DPI", "200"))  # was 300. make it tunable
 
 if not all([AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, S3_BUCKET]):
     raise EnvironmentError("Missing one or more AWS environment variables.")
 
-# AWS Clients
 s3 = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
     region_name=AWS_REGION,
 )
-
 textract = boto3.client(
     "textract",
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -51,9 +47,10 @@ textract = boto3.client(
 
 @app.post("/process-receipt")
 async def process_receipt(request: Request):
+    pdf_path = None
+    png_path = None
     try:
         logger.info("📥 Received request to /process-receipt")
-
         body = await request.json()
         if "file" not in body or "filename" not in body:
             return JSONResponse(status_code=400, content={"error": "Missing 'file' or 'filename' in request body."})
@@ -61,52 +58,60 @@ async def process_receipt(request: Request):
         base64_file = body["file"]
         original_filename = body["filename"]
 
-        logger.info(f"📦 Base64 input starts: {base64_file[:30]}...")
+        # Strip data URL prefix if present
+        if base64_file.startswith("data:"):
+            base64_file = base64_file.split(",", 1)[1]
 
+        # 1) Stream-decode base64 to a temp PDF on disk
         try:
-            file_bytes = base64.b64decode(base64_file)
-            logger.info(f"📄 Decoded file size: {len(file_bytes)} bytes")
-            logger.info(f"📄 First 10 bytes: {file_bytes[:10]!r}")
-        except Exception as e:
-            logger.error("❌ Failed to decode base64", exc_info=True)
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
+                pdf_path = tmp_pdf.name
+                src = io.BytesIO(base64_file.encode("ascii"))
+                base64.decode(src, tmp_pdf)  # no giant in-memory bytes
+            pdf_size = os.path.getsize(pdf_path)
+            logger.info(f"📄 Decoded PDF size on disk: {pdf_size} bytes")
+        except Exception:
+            logger.error("❌ Failed to decode base64 to PDF", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Invalid base64 string."})
 
-        # Flatten PDF to image
+        # 2) Flatten first page to PNG written directly to disk
         try:
-            logger.info("🧼 Flattening PDF using PyMuPDF...")
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            page = doc.load_page(0)  # only first page for now
-            pix = page.get_pixmap(dpi=300)
-            image_bytes = pix.tobytes("png")
-            logger.info(f"📄 Flattened PDF size: {len(image_bytes)} bytes")
-        except Exception as e:
+            logger.info(f"🧼 Flattening PDF with PyMuPDF at {FLATTEN_DPI} DPI...")
+            doc = fitz.open(pdf_path)
+            page = doc.load_page(0)
+            pix = page.get_pixmap(dpi=FLATTEN_DPI, alpha=False)  # avoid RGBA
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_png:
+                png_path = tmp_png.name
+            pix.save(png_path)  # write file, do not build image_bytes
+            doc.close()
+            png_size = os.path.getsize(png_path)
+            logger.info(f"🖼️ PNG on disk size: {png_size} bytes")
+        except Exception:
             logger.error("❌ PDF flattening failed", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Could not flatten PDF."})
 
-        # Keep original name prefix, append UUID, enforce .png
-        filename_base = os.path.splitext(original_filename)[0]
-        filename = f"{filename_base}-{uuid.uuid4()}.png"
-
-        # Upload image to S3
+        # 3) Upload PNG by streaming from disk
         try:
+            filename_base = os.path.splitext(original_filename)[0]
+            filename = f"{filename_base}-{uuid.uuid4()}.png"
             logger.info(f"☁️ Uploading image to S3 as: {filename}")
-            s3.put_object(
+            s3.upload_file(
+                Filename=png_path,
                 Bucket=S3_BUCKET,
                 Key=filename,
-                Body=image_bytes,
-                ContentType="image/png",
+                ExtraArgs={"ContentType": "image/png"},
             )
-        except Exception as e:
+        except Exception:
             logger.error("❌ Failed to upload to S3", exc_info=True)
             return JSONResponse(status_code=500, content={"error": "S3 upload failed."})
 
-        # Call Textract AnalyzeExpense
+        # 4) Call Textract AnalyzeExpense unchanged
         try:
             logger.info("🧠 Calling Textract (analyze_expense)...")
             response = textract.analyze_expense(
                 Document={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}}
             )
-        except Exception as e:
+        except Exception:
             logger.error("❌ Textract rejected the document", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Unsupported document format."})
 
@@ -138,6 +143,14 @@ async def process_receipt(request: Request):
             "line_items": line_items
         })
 
-    except Exception as e:
+    except Exception:
         logger.error("🔥 Unhandled exception during /process-receipt", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Internal server error."})
+    finally:
+        # Cleanup temp files
+        for p in (pdf_path, png_path):
+            try:
+                if p and os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
