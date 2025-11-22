@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import base64
 import logging
@@ -25,7 +24,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# AWS Credentials
+# AWS credentials
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")
 AWS_REGION = os.environ.get("AWS_REGION")
@@ -34,7 +33,7 @@ S3_BUCKET = os.environ.get("S3_BUCKET")
 if not all([AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, S3_BUCKET]):
     raise EnvironmentError("Missing one or more AWS environment variables.")
 
-# AWS Clients
+# AWS clients
 s3 = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -66,14 +65,14 @@ def sniff_kind(header: bytes):
     return (None, None, None)
 
 
-# Shared helper to decode, extract, flatten/upload to S3
-async def prepare_image_from_request(request: Request):
+# Convert uploaded file to a list of image bytes, one per page
+async def pdf_or_image_to_images(request: Request):
     body = await request.json()
 
     if "file" not in body or "filename" not in body:
         return None, JSONResponse(
             status_code=400,
-            content={"error": "Missing 'file' or 'filename' in request body."},
+            content={"error": "Missing file or filename in request body."},
         )
 
     base64_file = body["file"]
@@ -94,53 +93,83 @@ async def prepare_image_from_request(request: Request):
     if kind == "heic":
         return None, JSONResponse(status_code=415, content={"error": "HEIC not supported."})
 
-    filename_base = os.path.splitext(original_filename)[0]
-
+    # If it's an image, return as one page list
     if kind in ("jpeg", "png", "tiff"):
-        image_bytes = file_bytes
-        ct = content_type
-        filename = f"{filename_base}-{uuid.uuid4()}{ext}"
-    else:
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            page = doc.load_page(0)
+        return [
+            {
+                "bytes": file_bytes,
+                "ext": ext,
+                "content_type": content_type
+            }
+        ], None
+
+    # If it's a PDF, flatten all pages
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        pages = []
+
+        for i in range(len(doc)):
+            page = doc.load_page(i)
             pix = page.get_pixmap(dpi=150, alpha=False)
             image_bytes = pix.tobytes("png")
-            doc.close()
-            filename = f"{filename_base}-{uuid.uuid4()}.png"
-            ct = "image/png"
-        except Exception:
-            return None, JSONResponse(status_code=400, content={"error": "Could not flatten PDF."})
 
-    try:
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=filename,
-            Body=image_bytes,
-            ContentType=ct,
-        )
+            pages.append({
+                "bytes": image_bytes,
+                "ext": ".png",
+                "content_type": "image/png"
+            })
+
+        doc.close()
+        return pages, None
+
     except Exception:
-        return None, JSONResponse(status_code=500, content={"error": "S3 upload failed."})
-
-    return filename, None
+        return None, JSONResponse(status_code=400, content={"error": "Could not flatten PDF."})
 
 
-# -------------------------------------------------------------
-# 1. EXPENSE RECEIPT ENDPOINT (AnalyzeExpense)
-# -------------------------------------------------------------
+# Upload a single image to S3
+def upload_to_s3(image_bytes, ext, content_type, base_name):
+    filename = f"{base_name}-{uuid.uuid4()}{ext}"
+
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=filename,
+        Body=image_bytes,
+        ContentType=content_type,
+    )
+
+    return filename
+
+
+# -------------------------------------------------------------------
+# 1. AnalyzeExpense (receipt) endpoint
+# -------------------------------------------------------------------
 @app.post("/process-receipt")
 async def process_receipt(request: Request):
     try:
-        filename, error = await prepare_image_from_request(request)
+        pages, error = await pdf_or_image_to_images(request)
         if error:
             return error
+
+        # Amazon AnalyzeExpense accepts only one page
+        first_page = pages[0]
+        base_name = "receipt"
+
+        try:
+            filename = upload_to_s3(
+                first_page["bytes"],
+                first_page["ext"],
+                first_page["content_type"],
+                base_name
+            )
+        except Exception:
+            return JSONResponse(status_code=500, content={"error": "S3 upload failed."})
 
         try:
             response = textract.analyze_expense(
                 Document={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}}
             )
         except Exception:
-            return JSONResponse(status_code=400, content={"error": "Textract AnalyzeExpense failed."})
+            return JSONResponse(status_code=400, content={"error": "AnalyzeExpense failed."})
 
         raw_fields = {}
         line_items = []
@@ -148,8 +177,8 @@ async def process_receipt(request: Request):
         for doc in response.get("ExpenseDocuments", []):
             for field in doc.get("SummaryFields", []):
                 if "Type" in field and "ValueDetection" in field:
-                    name = field["Type"].get("Text", "").strip().upper().replace(" ", "_")
-                    value = field["ValueDetection"].get("Text", "").strip()
+                    name = field["Type"]["Text"].strip().upper().replace(" ", "_")
+                    value = field["ValueDetection"]["Text"].strip()
                     if name and value:
                         raw_fields[name] = value
 
@@ -165,45 +194,52 @@ async def process_receipt(request: Request):
 
         return JSONResponse(
             status_code=200,
-            content={
-                "raw_fields": raw_fields,
-                "line_items": line_items,
-            },
+            content={"raw_fields": raw_fields, "line_items": line_items},
         )
 
     except Exception:
         return JSONResponse(status_code=500, content={"error": "Internal server error."})
 
 
-# -------------------------------------------------------------
-# 2. BASIC OCR ENDPOINT (DetectDocumentText)
-# -------------------------------------------------------------
+# -------------------------------------------------------------------
+# 2. Regular OCR endpoint (multi page supported)
+# -------------------------------------------------------------------
 @app.post("/process-ocr")
 async def process_ocr(request: Request):
     try:
-        filename, error = await prepare_image_from_request(request)
+        pages, error = await pdf_or_image_to_images(request)
         if error:
             return error
 
-        try:
-            response = textract.detect_document_text(
-                Document={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}}
-            )
-        except Exception:
-            return JSONResponse(status_code=400, content={"error": "Textract OCR failed."})
+        all_lines = []
 
-        text_lines = [
-            block.get("Text", "")
-            for block in response.get("Blocks", [])
-            if block.get("BlockType") == "LINE"
-        ]
+        for page_index, page_data in enumerate(pages):
+            base_name = f"ocr-page-{page_index}"
+
+            try:
+                filename = upload_to_s3(
+                    page_data["bytes"],
+                    page_data["ext"],
+                    page_data["content_type"],
+                    base_name
+                )
+            except Exception:
+                return JSONResponse(status_code=500, content={"error": "S3 upload failed."})
+
+            try:
+                response = textract.detect_document_text(
+                    Document={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}}
+                )
+            except Exception:
+                return JSONResponse(status_code=400, content={"error": "Textract OCR failed."})
+
+            for block in response.get("Blocks", []):
+                if block.get("BlockType") == "LINE":
+                    all_lines.append(block.get("Text", ""))
 
         return JSONResponse(
             status_code=200,
-            content={
-                "text_lines": text_lines,
-                "raw": response,
-            },
+            content={"text_lines": all_lines},
         )
 
     except Exception:
